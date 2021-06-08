@@ -49,9 +49,10 @@ class FusedLearnedInterpolation:
       extract_patch_method='roll',
       fuse_constraints=False,
       fuse_patches=False,
+      constrain_with_conv=False,
       tile_layout=None,
   ):
-    """Constructs object and performed necessary pre-computate."""
+    """Constructs object and performs necessary pre-computate."""
     del dt, physics_specs  # unused.
 
     stencil_sizes = (stencil_size,) * grid.ndim
@@ -78,7 +79,8 @@ class FusedLearnedInterpolation:
 
     if fuse_constraints:
       self._interpolators = layers.fuse_spatial_derivative_layers(
-          derivatives, all_logits, fuse_patches)
+          derivatives, all_logits, fuse_patches=fuse_patches,
+          constrain_with_conv=constrain_with_conv)
     else:
       split_logits = jnp.split(all_logits, np.cumsum(output_sizes), axis=-1)
       self._interpolators = {
@@ -97,7 +99,70 @@ class FusedLearnedInterpolation:
     if interpolator is None:
       raise KeyError(f'No interpolator for key {key}. '
                      f'Available keys: {list(self._interpolators.keys())}')
-    return grids.AlignedArray(interpolator(c.data)[..., 0], offset)
+    result = jnp.squeeze(interpolator(c.data), axis=-1)
+    return grids.AlignedArray(result, offset)
+
+
+@gin.configurable
+class NearestNeighborInterpolation:
+  """Like LearnedInterpolation, but only based on the adjacent cells."""
+
+  def __init__(
+      self,
+      grid: grids.Grid,
+      dt: float,
+      physics_specs: physics_specifications.BasePhysicsSpecs,
+      v,
+      tags=(None,),
+      tower_factory=towers.forward_tower_factory,
+      name='nearest_neighbor_interpolation',
+  ):
+    """Constructs object and performs necessary pre-computate."""
+    del dt, physics_specs  # unused.
+
+    derivative_orders = (0,) * grid.ndim
+    derivatives = collections.OrderedDict()
+
+    for u in v:
+      for target_offset in grids.control_volume_offsets(u):
+        for tag in tags:
+          key = (u.offset, target_offset, tag)
+          stencil_sizes = tuple(
+              1 if s == t else 2 for s, t in zip(u.offset, target_offset)
+          )
+          # TODO(shoyer): consider optimizing the implementation, but for now
+          # extract_patch_method='roll' seems fine
+          derivatives[key] = layers.SpatialDerivativeFromLogits(
+              stencil_sizes,
+              u.offset,
+              target_offset,
+              derivative_orders=derivative_orders,
+              steps=grid.step,
+              extract_patch_method='roll',
+              tile_layout=None)
+
+    output_sizes = [deriv.subspace_size for deriv in derivatives.values()]
+    cnn_network = tower_factory(sum(output_sizes), grid.ndim, name=name)
+    inputs = jnp.stack([u.data for u in v], axis=-1)
+    all_logits = cnn_network(inputs)
+
+    split_logits = jnp.split(all_logits, np.cumsum(output_sizes), axis=-1)
+    self._interpolators = {
+        k: functools.partial(derivative, logits=logits)
+        for (k, derivative), logits in zip(derivatives.items(), split_logits)
+    }
+
+  def __call__(self, c, offset, grid, v, dt, tag=None):
+    del grid, dt  # not used.
+    # TODO(dkochkov) Add decorator to expand/squeeze channel dim.
+    c = grids.AlignedArray(jnp.expand_dims(c.data, -1), c.offset)
+    key = (c.offset, offset, tag)
+    interpolator = self._interpolators.get(key)
+    if interpolator is None:
+      raise KeyError(f'No interpolator for key {key}. '
+                     f'Available keys: {list(self._interpolators.keys())}')
+    result = jnp.squeeze(interpolator(c.data), axis=-1)
+    return grids.AlignedArray(result, offset)
 
 
 @gin.configurable
